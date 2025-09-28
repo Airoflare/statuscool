@@ -49,12 +49,9 @@ import (
 	textTemplate "text/template"
 	"time"
 
-	"github.com/caddyserver/certmagic"
-	"github.com/go-chi/chi/v5"
+github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/mattn/go-sqlite3"
-	"github.com/mholt/acmez/acme"
-	"github.com/miekg/dns"
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/mod/semver"
 	"gopkg.in/yaml.v3"
@@ -4098,10 +4095,7 @@ func main() {
 		return
 	}
 	if errors.Is(err, sql.ErrNoRows) {
-		metaSSL = "true"
-		if BUILD == "dev" || *portFlag != 80 {
-			metaSSL = "false"
-		}
+		metaSSL = "false"
 
 		err = updateMetaValue(tx, "ssl", metaSSL)
 		if err != nil {
@@ -4145,34 +4139,7 @@ func main() {
 	if BUILD == "dev" {
 		r.Use(middleware.Logger)
 	}
-	if BUILD == "release" && metaSSL == "true" {
-		r.Use(func(h http.Handler) http.Handler {
-			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if certmagic.DefaultACME.HandleHTTPChallenge(w, r) {
-					return
-				}
 
-				if r.TLS == nil && r.Header.Get("X-Forwarded-Proto") != "https" {
-					toURL := "https://"
-
-					requestHost, _, err := net.SplitHostPort(r.Host)
-					if err != nil {
-						requestHost = r.Host
-					}
-
-					toURL += requestHost
-					toURL += r.URL.RequestURI()
-
-					w.Header().Set("Connection", "close")
-
-					http.Redirect(w, r, toURL, http.StatusFound)
-
-					return
-				}
-				h.ServeHTTP(w, r)
-			})
-		})
-	}
 	r.Use(func(h http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if metaSetup != "done" &&
