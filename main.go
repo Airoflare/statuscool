@@ -6,20 +6,14 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"database/sql"
 	"embed"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -28,7 +22,6 @@ import (
 	"io"
 	"io/fs"
 	"log"
-	"math/big"
 	mathRand "math/rand"
 	"mime"
 	"net"
@@ -49,23 +42,22 @@ import (
 	textTemplate "text/template"
 	"time"
 
-github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/mattn/go-sqlite3"
+	"github.com/miekg/dns"
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/mod/semver"
 	"gopkg.in/yaml.v3"
 )
 
 var BUILD = "dev"
-var CA = certmagic.LetsEncryptStagingCA
 var VERSION = "v0.3.0"
 
 //go:embed schema.sql
 var sqlSchema string
 
-const SELF_SIGNED_CERT_NAME = "self-signed-cert.pem"
-const SELF_SIGNED_KEY_NAME = "self-signed-key.pem"
+
 
 func Migration1715019045AddSlugColumns(tx *sql.Tx) error {
 	requiresSlug := map[string]string{
@@ -2517,221 +2509,11 @@ func neuter(next http.Handler) http.Handler {
 	})
 }
 
-func attemptCertificateAcquisition(ctx context.Context, domain string) error {
-	var testCache *certmagic.Cache
-	testCache = certmagic.NewCache(certmagic.CacheOptions{
-		GetConfigForCert: func(cert certmagic.Certificate) (*certmagic.Config, error) {
-			return certmagic.New(testCache, certmagic.Config{}), nil
-		},
-	})
-	testCache.Stop()
 
-	testMagic := certmagic.New(testCache, certmagic.Config{})
 
-	testACME := certmagic.NewACMEIssuer(testMagic, certmagic.ACMEIssuer{
-		CA:     certmagic.LetsEncryptStagingCA,
-		Email:  " ",
-		Agreed: true,
-	})
 
-	testMagic.Issuers = []certmagic.Issuer{testACME}
 
-	err := testMagic.ObtainCertSync(ctx, domain)
-	if err != nil {
-		return fmt.Errorf("attemptCertificateAcquisition.ObtainCertSync: %w", err)
-	}
 
-	fileStorage, ok := certmagic.Default.Storage.(*certmagic.FileStorage)
-	if !ok {
-		return fmt.Errorf("attemptCertificateAcquisition.FileStorageAssert: %w", err)
-	}
-
-	err = os.RemoveAll(
-		fileStorage.Filename(certmagic.StorageKeys.CertsPrefix(testACME.IssuerKey())),
-	)
-	if err != nil {
-		return fmt.Errorf("attemptCertificateAcquisition.RemoveAll: %w", err)
-	}
-
-	err = certmagic.ManageSync(ctx, []string{domain})
-	if err != nil {
-		return fmt.Errorf("attemptCertificateAcquisition.ManageSync: %w", err)
-	}
-
-	return nil
-}
-
-func monitorUnconfirmedDomainLoop(ctx context.Context, wg *sync.WaitGroup) {
-	tick := time.Tick(time.Minute * 1)
-
-	for {
-		if metaUnconfirmedDomain == "" || metaUnconfirmedDomainProblem != "" {
-			wg.Done()
-			return
-		}
-
-		select {
-		case <-tick:
-			func() {
-				found, err := lookupDomain(metaUnconfirmedDomain)
-				if err != nil {
-					log.Printf("monitorUnconfirmedDomainLoop.lookupDomain: %s", err)
-					return
-				}
-
-				if !found {
-					return
-				}
-
-				err = attemptCertificateAcquisition(ctx, metaUnconfirmedDomain)
-				if err != nil {
-					unconfirmedDomainProblemMsg := "An unexpected error occurred"
-
-					var acmeProblem acme.Problem
-					if errors.As(err, &acmeProblem) {
-						var ok bool
-						unconfirmedDomainProblemMsg, ok = acmeProblemTypeMessages[acmeProblem.Type]
-						if !ok {
-							unconfirmedDomainProblemMsg = "An unhandled error occurred " +
-								acmeProblem.Type
-						}
-					} else {
-						log.Printf("monitorUnconfirmedDomainLoop.attemptCertificateAcquisition: %s", err)
-					}
-
-					tx, err := rwDB.Begin()
-					if err != nil {
-						log.Printf("monitorUnconfirmedDomainLoop.BeginUnconfirmedDomainProblem: %s", err)
-						return
-					}
-					defer tx.Rollback()
-
-					metaUnconfirmedDomainProblem = unconfirmedDomainProblemMsg
-					err = updateMetaValue(tx, "unconfirmedDomainProblem", metaUnconfirmedDomainProblem)
-					if err != nil {
-						log.Printf("monitorUnconfirmedDomainLoop.UpdateUnconfirmedDomainProblem: %s", err)
-						return
-					}
-
-					if err := tx.Commit(); err != nil {
-						log.Printf("monitorUnconfirmedDomainLoop.CommitUnconfirmedDomainProblem: %s", err)
-						return
-					}
-
-					return
-				}
-
-				tx, err := rwDB.Begin()
-				if err != nil {
-					log.Printf("monitorUnconfirmedDomainLoop.Begin: %s", err)
-					return
-				}
-				defer tx.Rollback()
-
-				metaDomain = metaUnconfirmedDomain
-				err = updateMetaValue(tx, "domain", metaUnconfirmedDomain)
-				if err != nil {
-					log.Printf("monitorUnconfirmedDomainLoop.updateMetaValueDomain: %s", err)
-					return
-				}
-
-				metaUnconfirmedDomain = ""
-				err = updateMetaValue(tx, "unconfirmedDomain", "")
-				if err != nil {
-					log.Printf("monitorUnconfirmedDomainLoop.updateMetaValueUnconfirmedDomain: %s", err)
-					return
-				}
-
-				metaUnconfirmedDomainProblem = ""
-				err = updateMetaValue(tx, "unconfirmedDomainProblem", "")
-				if err != nil {
-					log.Printf("monitorUnconfirmedDomainLoop.updateMetaValueUnconfirmedDomainProblem: %s", err)
-					return
-				}
-
-				if err := tx.Commit(); err != nil {
-					log.Printf("monitorUnconfirmedDomainLoop.Commit: %s", err)
-					return
-				}
-			}()
-		case <-ctx.Done():
-			wg.Done()
-			return
-		}
-	}
-}
-
-func GenerateSelfSignedCertificate() {
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		log.Fatalf("Failed to generate key: %v", err)
-	}
-
-	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
-	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
-	if err != nil {
-		log.Fatalf("Failed to generate serial number: %v", err)
-	}
-
-	notBefore := time.Now().UTC()
-	notAfter := notBefore.Add(time.Hour * 720)
-
-	template := x509.Certificate{
-		SerialNumber: serialNumber,
-		Subject: pkix.Name{
-			Organization: []string{"Statuscool Installer"},
-		},
-		NotBefore:             notBefore,
-		NotAfter:              notAfter,
-		KeyUsage:              x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-	}
-	template.IsCA = true
-	template.KeyUsage |= x509.KeyUsageCertSign
-
-	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
-	if err != nil {
-		log.Fatalf("Failed to create certificate: %v", err)
-	}
-
-	fingerprint := sha256.Sum256(derBytes)
-	fingerprintHex := hex.EncodeToString(fingerprint[:])
-
-	certFile, err := os.Create(SELF_SIGNED_CERT_NAME)
-	if err != nil {
-		log.Fatalf("Failed to open %s for writing: %v", SELF_SIGNED_CERT_NAME, err)
-	}
-	if err := pem.Encode(certFile, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes}); err != nil {
-		log.Fatalf("Failed to write data to %s: %v", SELF_SIGNED_CERT_NAME, err)
-	}
-	if err := certFile.Close(); err != nil {
-		log.Fatalf("Error closing %s: %v", SELF_SIGNED_CERT_NAME, err)
-	}
-
-	keyOut, err := os.OpenFile(SELF_SIGNED_KEY_NAME, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
-	if err != nil {
-		log.Fatalf("Failed to open %s for writing: %v", SELF_SIGNED_KEY_NAME, err)
-	}
-	privBytes, err := x509.MarshalPKCS8PrivateKey(priv)
-	if err != nil {
-		log.Fatalf("Unable to marshal private key: %v", err)
-	}
-	if err := pem.Encode(keyOut, &pem.Block{Type: "PRIVATE KEY", Bytes: privBytes}); err != nil {
-		log.Fatalf("Failed to write data to %s: %v", SELF_SIGNED_KEY_NAME, err)
-	}
-	if err := keyOut.Close(); err != nil {
-		log.Fatalf("Error closing %s: %v", SELF_SIGNED_KEY_NAME, err)
-	}
-
-	formattedFingerprint := ""
-	for i := 0; i < len(fingerprintHex); i += 2 {
-		formattedFingerprint +=
-			strings.ToUpper(string(fingerprintHex[i])+string(fingerprintHex[i+1])) + ":"
-	}
-	formattedFingerprint = formattedFingerprint[:len(formattedFingerprint)-1]
-	fmt.Println(formattedFingerprint)
-}
 
 var dockerFlag = flag.Bool("docker", false, "")
 
@@ -4024,14 +3806,8 @@ func generateConfig(tx *sql.Tx) (string, error) {
 
 func main() {
 	portFlag := flag.Int("port", 80, "")
-	selfSignedFlag := flag.Bool("generate-self-signed-cert", false, "")
 
 	flag.Parse()
-
-	if *selfSignedFlag {
-		GenerateSelfSignedCertificate()
-		return
-	}
 
 	db = initDB(false)
 
@@ -4452,62 +4228,7 @@ func main() {
 
 		go httpServer.Serve(httpLn)
 
-		if metaSSL == "true" {
-			certmagic.Default.Storage = &certmagic.FileStorage{Path: "certmagic"}
-			certmagic.DefaultACME.Agreed = true
-			certmagic.DefaultACME.CA = CA
-			certmagic.DefaultACME.Email = " "
 
-			domains := []string{}
-			if domain != "" {
-				domains = append(domains, metaDomain)
-			}
-
-			tlsConfig, err := certmagic.TLS(domains)
-			if err != nil {
-				log.Fatalf("main.TLS: %s", err)
-			}
-			tlsConfig.NextProtos = append([]string{"h2", "http/1.1"}, tlsConfig.NextProtos...)
-			getCertificateCertMagic := tlsConfig.GetCertificate
-			tlsConfig.GetCertificate = func(clientHello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-				certificate, err := getCertificateCertMagic(clientHello)
-				if err != nil {
-					certificate, err := tls.LoadX509KeyPair(
-						SELF_SIGNED_CERT_NAME,
-						SELF_SIGNED_KEY_NAME,
-					)
-					if err != nil {
-						log.Printf("main.LoadX509KeyPair: %s", err)
-						return &certificate, err
-					}
-
-					return &certificate, nil
-				}
-
-				return certificate, nil
-			}
-
-			httpsLn, err := tls.Listen("tcp", fmt.Sprintf(":%d", 443), tlsConfig)
-			if err != nil {
-				log.Fatalf("main.ListenHTTPS: %s", err)
-			}
-
-			httpsServer = &http.Server{
-				ReadHeaderTimeout: 10 * time.Second,
-				ReadTimeout:       30 * time.Second,
-				WriteTimeout:      2 * time.Minute,
-				IdleTimeout:       5 * time.Minute,
-				Handler:           r,
-				BaseContext:       func(listener net.Listener) context.Context { return appCtx },
-			}
-
-			go httpsServer.Serve(httpsLn)
-
-			if unconfirmedDomain != "" && unconfirmedDomainProblem == "" {
-				appWg.Add(1)
-				go monitorUnconfirmedDomainLoop(appCtx, &appWg)
-			}
-		}
 	}
 
 	<-shutdownCh
@@ -17867,85 +17588,7 @@ func postSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		err = attemptCertificateAcquisition(r.Context(), domain)
-		if err != nil {
-			errMsg := "An unexpected error occurred"
 
-			var acmeProblem acme.Problem
-			if errors.As(err, &acmeProblem) {
-				var ok bool
-				errMsg, ok = acmeProblemTypeMessages[acmeProblem.Type]
-				if !ok {
-					errMsg = "An unhandled error occurred " +
-						acmeProblem.Type
-				}
-			} else {
-				log.Printf("postSettings.attemptCertificateAcquisition: %s", err)
-			}
-
-			if metaDomain == "" {
-				tx, err := rwDB.Begin()
-				if err != nil {
-					log.Printf("postSettings.BeginUnconfirmedDomainProblem: %s", err)
-					w.WriteHeader(http.StatusInternalServerError)
-					w.Write([]byte(
-						`
-						<div id="banner" class="banner" hx-swap-oob="true">
-							<span>An unexpected error occurred</span>
-						</div>
-					`,
-					))
-					return
-				}
-				defer tx.Rollback()
-
-				err = updateMetaValue(tx, "unconfirmedDomainProblem", errMsg)
-				if err != nil {
-					log.Printf("postSettings.updateMetaValueDomainProblem: %s", err)
-					w.WriteHeader(http.StatusInternalServerError)
-					w.Write([]byte(
-						`
-						<div id="banner" class="banner" hx-swap-oob="true">
-							<span>An unhandled error occurred</span>
-						</div>
-					`,
-					))
-					return
-				}
-
-				if err := tx.Commit(); err != nil {
-					log.Printf("postSettings.CommitUnconfirmedDomainProblem %s", err)
-					w.WriteHeader(http.StatusInternalServerError)
-					w.Write([]byte(
-						`
-						<div id="banner" class="banner" hx-swap-oob="true">
-							<span>An unhandled error occurred</span>
-						</div>
-					`,
-					))
-					return
-				}
-
-				metaUnconfirmedDomainProblem = errMsg
-			}
-
-			if errMsg == "An unexpected error occurred" {
-				w.WriteHeader(http.StatusInternalServerError)
-			} else {
-				w.WriteHeader(http.StatusBadRequest)
-			}
-
-			w.Write([]byte(
-				fmt.Sprintf(`
-					<div id="banner" class="banner" hx-swap-oob="true">
-						<span>%s</span>
-					</div>
-				`,
-					errMsg,
-				),
-			))
-			return
-		}
 
 		tx, err := rwDB.Begin()
 		if err != nil {
@@ -20074,11 +19717,7 @@ func lookupDomain(domain string) (bool, error) {
 	return len(r.Answer) > 0, nil
 }
 
-var acmeProblemTypeMessages = map[string]string{
-	acme.ProblemTypeDNS:                "Let's Encrypt can't find your domain's DNS record, verify it exists and then retry",
-	acme.ProblemTypeConnection:         "Let's Encrypt could not reach your server, ensure your server is publicly accessible on ports 80 and 443, then try again",
-	acme.ProblemTypeRejectedIdentifier: "Let's Encrypt will not issue certificates for this domain",
-}
+
 
 func postSetupDomain(w http.ResponseWriter, r *http.Request) {
 	domainParam := strings.ToLower(r.PostFormValue("domain"))
@@ -20168,46 +19807,7 @@ func postSetupDomain(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		err = certmagic.ManageSync(r.Context(), []string{domainParam})
-		if err != nil {
-			var acmeProblem acme.Problem
-			if errors.As(err, &acmeProblem) {
-				if msg, ok := acmeProblemTypeMessages[acmeProblem.Type]; ok {
-					w.WriteHeader(http.StatusBadRequest)
-					w.Write([]byte(
-						fmt.Sprintf(`
-							<div id="alert" class="alert domain-alert" hx-swap-oob="true">
-								%s
-							</div>
-						`,
-							msg,
-						),
-					))
-					return
-				}
 
-				w.WriteHeader(http.StatusBadRequest)
-				w.Write([]byte(
-					fmt.Sprintf(`
-						<div id="alert" class="alert domain-alert" hx-swap-oob="true">
-							An unhandled error occurred %s
-						</div>
-						`,
-						acmeProblem.Type,
-					),
-				))
-				return
-			}
-
-			log.Printf("postSetupDomain.ManageSync: %s", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte(`
-				<div id="alert" class="alert domain-alert" hx-swap-oob="true">
-					An unexpected error occurred
-				</div>
-			`))
-			return
-		}
 	}
 
 	tx, err := rwDB.Begin()
@@ -20291,8 +19891,7 @@ func postSetupDomainSkip(w http.ResponseWriter, r *http.Request) {
 	metaSetup = "account"
 	metaUnconfirmedDomain = domainParam
 
-	appWg.Add(1)
-	go monitorUnconfirmedDomainLoop(appCtx, &appWg)
+
 
 	w.Header().Add("HX-Location", "/setup/account")
 }

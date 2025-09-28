@@ -18,7 +18,7 @@ COPY schema.sql ./
 RUN apk add --update gcc musl-dev
 
 RUN CGO_ENABLED=1 go build -o statuscool \
-    -ldflags "-w -s -X main.CA=https://acme-v02.api.letsencrypt.org/directory -X main.BUILD=release"
+    -ldflags "-w -s -X main.BUILD=release"
 
 
 FROM alpine:latest     

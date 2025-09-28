@@ -3,10 +3,8 @@ module github.com/goksan/statuscool
 go 1.22
 
 require (
-	github.com/caddyserver/certmagic v0.20.0
 	github.com/go-chi/chi/v5 v5.0.11
 	github.com/mattn/go-sqlite3 v1.14.19
-	github.com/mholt/acmez v1.2.0
 	github.com/miekg/dns v1.1.55
 	golang.org/x/crypto v0.18.0
 	golang.org/x/mod v0.11.0
