@@ -1,0 +1,11 @@
+services:
+  statuscool:
+    image: ghcr.io/airoflare/statuscool:latest
+    container_name: statuscool
+    volumes:
+      - statuscool-data:/app/statuscool-data
+    ports:
+      - 80:80
+      
+volumes:
+  statuscool-data:
