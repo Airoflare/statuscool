@@ -4152,7 +4152,7 @@ func main() {
 					return
 				}
 
-				if r.TLS == nil {
+				if r.TLS == nil && r.Header.Get("X-Forwarded-Proto") != "https" {
 					toURL := "https://"
 
 					requestHost, _, err := net.SplitHostPort(r.Host)
